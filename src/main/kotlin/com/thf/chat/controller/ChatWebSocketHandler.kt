@@ -1,7 +1,9 @@
 package com.thf.chat.controller
 
 import com.google.gson.Gson
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.google.gson.reflect.TypeToken
 import com.thf.chat.model.ChatRoom
 import org.springframework.stereotype.Component
 import org.springframework.web.socket.CloseStatus
@@ -17,15 +19,26 @@ class ChatWebSocketHandler : TextWebSocketHandler() {
     override fun handleTextMessage(session: WebSocketSession, message: TextMessage) {
 
         val msg = Gson().fromJson(message.payload, JsonObject::class.java)
-        val room = findRoomById(msg.get("roomId").asInt)
+        val room = findRoomById(session.roomId)
 
-        room?.apply {
+        if (room != null) {
             msg.apply {
                 remove("roomId")
                 addProperty("type", "chat")
+                addProperty("sender", session.username)
             }
-            getSessions().forEach() {
-                it.sendMessage(TextMessage(msg.toString()))
+
+            val whisperingTo = msg.remove("whisperingTo")?.asString
+
+            whisperingTo?.let {
+                msg.addProperty("whisperRecipient", it)
+                room.find(it)?.sendMessage(TextMessage(msg.toString()))
+                session.sendMessage(TextMessage(msg.toString()))
+            } ?: run {
+                msg.add("whisperRecipient", null)
+                room.getSessions().forEach() {
+                    it.sendMessage(TextMessage(msg.toString()))
+                }
             }
         }
     }
@@ -35,11 +48,29 @@ class ChatWebSocketHandler : TextWebSocketHandler() {
         if (rooms.isEmpty() || rooms.last().full) rooms.add(ChatRoom(generateChatRoomId()))
         val room = rooms.last()
 
+        //add user to room
         room.add(session)
+
+        //inform other users in room that user joined
+        val userJoinedMessage = JsonObject().apply {
+            addProperty("type", "userJoined")
+            addProperty("username", session.username)
+        }
+
+        room.getSessions().forEach {
+            if (it.username != session.username) it.sendMessage(TextMessage(userJoinedMessage.toString()))
+        }
+
+        //send info to new user
+        val users = Gson().toJsonTree(
+            room.getSessions().map { it.username },
+            (object : TypeToken<List<String>>(){}).type
+        ).asJsonArray
 
         val greetingMessage = JsonObject().apply {
             addProperty("type", "greeting")
-            addProperty("roomId", room.id)
+            addProperty("username", session.username)
+            add("users", users)
         }
 
         session.sendMessage(TextMessage(greetingMessage.toString()))
@@ -49,6 +80,11 @@ class ChatWebSocketHandler : TextWebSocketHandler() {
 
     override fun afterConnectionClosed(session: WebSocketSession, status: CloseStatus) {
 
+        val userLeftMessage = JsonObject().apply {
+            addProperty("type", "userLeft")
+            addProperty("username", session.username)
+        }
+
         val iterator = rooms.iterator()
 
         while (iterator.hasNext()) {
@@ -56,6 +92,9 @@ class ChatWebSocketHandler : TextWebSocketHandler() {
             if (room.contains(session)) {
                 room.remove(session)
                 if (room.empty) iterator.remove()
+                else room.getSessions().forEach {
+                    it.sendMessage(TextMessage(userLeftMessage.toString()))
+                }
                 break
             }
         }
@@ -82,4 +121,10 @@ class ChatWebSocketHandler : TextWebSocketHandler() {
         }
         return null
     }
+
+    private val WebSocketSession.username: String
+        get() = this.attributes["username"].toString()
+
+    private val WebSocketSession.roomId: Int
+        get() = this.attributes["roomId"] as Int
 }
